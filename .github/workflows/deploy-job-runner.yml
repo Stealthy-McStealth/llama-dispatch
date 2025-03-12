@@ -1,0 +1,179 @@
+name: deploy-llama-dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        default: production
+        type: choice
+        options:
+          - staging
+          - production
+  push:
+    paths:
+      - "job-runner/**"
+      - "payment-service/**"
+      - "notify-service/**"
+      - ".github/workflows/deploy-job-runner.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: llama-dispatch-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1
+  AWS_DEPLOY_ROLE: ${{ secrets.AWS_DEPLOY_ROLE }}
+  CONFIG_BUCKET: stealthy-mcstealth-llama-dispatch-staging-config-76653f09
+  CONFIG_NAMESPACE: llama-dispatch-config
+  DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment || 'production' }}
+  ECR_REPOSITORY_PREFIX: llama-dispatch
+  K8S_NAMESPACE: llama-dispatch
+  KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+  LLAMA_DISPATCH_BASE_URL: ${{ secrets.LLAMA_DISPATCH_BASE_URL }}
+
+jobs:
+  deploy:
+    name: Deploy ${{ matrix.service.name }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - name: job-runner
+            path: job-runner
+            config_profile: job-runner-prod
+            healthcheck_path: ""
+          - name: payment-service
+            path: payment-service
+            config_profile: payment-service-prod
+            healthcheck_path: /health
+          - name: notify-service
+            path: notify-service
+            config_profile: notify-service-prod
+            healthcheck_path: /health
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.service.path }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: ${{ matrix.service.path }}/requirements.txt
+
+      - name: Configure AWS credentials
+        if: env.AWS_DEPLOY_ROLE != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE }}
+          role-session-name: gha-${{ matrix.service.name }}-${{ github.run_id }}
+
+      - name: Resolve deployment metadata
+        id: meta
+        run: |
+          short_sha="${GITHUB_SHA::12}"
+          deploy_id="${{ matrix.service.name }}-${short_sha}-${GITHUB_RUN_NUMBER}"
+          config_bucket="${CONFIG_BUCKET}"
+          config_namespace="${CONFIG_NAMESPACE}"
+          config_object_key="env/${CONFIG_NAMESPACE}/${{ matrix.service.config_profile }}.env"
+          image_repo="${ECR_REPOSITORY_PREFIX}-${{ matrix.service.name }}"
+
+          cat <<EOF >> "${GITHUB_OUTPUT}"
+          short_sha=${short_sha}
+          deploy_id=${deploy_id}
+          config_bucket=${config_bucket}
+          config_namespace=${config_namespace}
+          config_object_key=${config_object_key}
+          image_repo=${image_repo}
+          EOF
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        if: env.AWS_DEPLOY_ROLE != ''
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR repository exists
+        if: env.AWS_DEPLOY_ROLE != ''
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "${{ steps.meta.outputs.image_repo }}" \
+            >/dev/null 2>&1 || \
+          aws ecr create-repository \
+            --repository-name "${{ steps.meta.outputs.image_repo }}" \
+            --image-scanning-configuration scanOnPush=true
+
+      - name: Build container image
+        if: env.AWS_DEPLOY_ROLE != ''
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          image_uri="${ECR_REGISTRY}/${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.short_sha }}"
+          docker build -t "${image_uri}" .
+          cat <<EOF >> "${GITHUB_OUTPUT}"
+          image_uri=${image_uri}
+          EOF
+
+      - name: Push container image
+        if: env.AWS_DEPLOY_ROLE != ''
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+        run: |
+          docker push "${IMAGE_URI}"
+
+      - name: Install kubectl
+        if: env.KUBECONFIG_B64 != ''
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - name: Deploy image and runtime configuration
+        if: env.KUBECONFIG_B64 != '' && env.AWS_DEPLOY_ROLE != ''
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+        run: |
+          mkdir -p "${HOME}/.kube"
+          echo "${KUBECONFIG_B64}" | base64 --decode > "${HOME}/.kube/config"
+
+          kubectl -n "${K8S_NAMESPACE}" set env deployment/"${{ matrix.service.name }}" \
+            RELEASE_ID="${{ steps.meta.outputs.deploy_id }}" \
+            RELEASE_COMMIT="${{ steps.meta.outputs.short_sha }}" \
+            REMOTE_ENV_PROFILE="${{ matrix.service.config_profile }}" \
+            CONFIG_BUCKET="${{ steps.meta.outputs.config_bucket }}" \
+            CONFIG_NAMESPACE="${{ steps.meta.outputs.config_namespace }}" \
+            CONFIG_OBJECT_KEY="${{ steps.meta.outputs.config_object_key }}"
+
+          kubectl -n "${K8S_NAMESPACE}" annotate deployment "${{ matrix.service.name }}" \
+            deploy.stealthymcstealth.com/release-id="${{ steps.meta.outputs.deploy_id }}" \
+            deploy.stealthymcstealth.com/commit="${{ steps.meta.outputs.short_sha }}" \
+            deploy.stealthymcstealth.com/config-bucket="${{ steps.meta.outputs.config_bucket }}" \
+            deploy.stealthymcstealth.com/config-namespace="${{ steps.meta.outputs.config_namespace }}" \
+            deploy.stealthymcstealth.com/config-object="${{ steps.meta.outputs.config_object_key }}" \
+            deploy.stealthymcstealth.com/config-profile="${{ matrix.service.config_profile }}" \
+            --overwrite
+
+          kubectl -n "${K8S_NAMESPACE}" set image deployment/"${{ matrix.service.name }}" \
+            "${{ matrix.service.name }}"="${IMAGE_URI}"
+
+          kubectl -n "${K8S_NAMESPACE}" rollout status deployment/"${{ matrix.service.name }}" --timeout=180s
+
+      - name: Smoke check HTTP service
+        if: matrix.service.healthcheck_path != '' && env.LLAMA_DISPATCH_BASE_URL != '' && env.AWS_DEPLOY_ROLE != ''
+        run: |
+          curl --fail --silent --show-error --max-time 10 \
+            "${{ env.LLAMA_DISPATCH_BASE_URL }}/${{ matrix.service.name }}${{ matrix.service.healthcheck_path }}"
