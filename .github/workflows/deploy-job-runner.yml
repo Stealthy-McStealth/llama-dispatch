@@ -49,7 +49,7 @@ jobs:
           - name: job-runner
             path: job-runner
             config_profile: job-runner-prod
-            healthcheck_path: ""
+            healthcheck_path: "/health"
           - name: payment-service
             path: payment-service
             config_profile: payment-service-prod
