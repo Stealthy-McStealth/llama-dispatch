@@ -17,8 +17,12 @@ SERVICE_NAME = "job-runner"
 CONFIG_BUCKET = os.environ.get("CONFIG_BUCKET")
 CONFIG_NAMESPACE = os.environ.get("CONFIG_NAMESPACE")
 
+# Remote env profile (set by deployment, e.g., job-runner-prod for production).
+CONFIG_PROFILE = os.environ.get("REMOTE_ENV_PROFILE", SERVICE_NAME)
+
 # Runtime config for this service from the shared store (blackbox).
-_runtime = get_runtime_config(SERVICE_NAME, bucket=CONFIG_BUCKET, namespace=CONFIG_NAMESPACE)
+# Uses CONFIG_PROFILE to load the correct S3 config object.
+_runtime = get_runtime_config(CONFIG_PROFILE, bucket=CONFIG_BUCKET, namespace=CONFIG_NAMESPACE)
 
 REDIS_URL = _runtime["REDIS_URL"]
 LOG_LEVEL = _runtime["LOG_LEVEL"]
@@ -29,6 +33,15 @@ WORK_DURATION_SECONDS = _runtime["WORK_DURATION_SECONDS"]
 HEARTBEAT_INTERVAL_SECONDS = _runtime["HEARTBEAT_INTERVAL_SECONDS"]
 SCHEDULER_TICK_INTERVAL_SECONDS = _runtime["SCHEDULER_TICK_INTERVAL_SECONDS"]
 HEALTHCHECK_INTERVAL_SECONDS = _runtime["HEALTHCHECK_INTERVAL_SECONDS"]
+
+# DNS error fragments used to detect hostname resolution failures.
+RESOLVE_ERROR_FRAGMENTS = (
+    "name or service not known",
+    "nodename nor servname",
+    "name resolution",
+    "resolve",
+    "getaddrinfo",
+)
 
 
 def redis_url() -> str:
